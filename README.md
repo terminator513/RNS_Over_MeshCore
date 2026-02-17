@@ -83,8 +83,7 @@ Add the following to your `~/.reticulum/config` file:
 
 | Issue | Solution |
 |-------|----------|
-| `UnicodeDecodeError` | Save `Meshcore_Interface.py` as **UTF-8 without BOM** |
-| `X25519 public key` errors | Normal — RF noise is being filtered by RNS. Reduce `loglevel` in config |
+| `Error while loading public key, ...` errors | Normal — RF noise is being filtered by RNS. Reduce `loglevel` in config |
 | Interface not connecting | Check `ble_name` matches your device, or verify serial port |
 | `meshcore module not found` | Run `pip install meshcore` |
 
