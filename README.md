@@ -79,26 +79,6 @@ Add the following to your `~/.reticulum/config` file:
 
 ---
 
-## Usage Examples
-
-### Check if interface is loaded:
-```bash
-rnsd --config ~/.reticulum
-# Look for: "[MeshCore] MeshCore connected over ble"
-```
-
-### List discovered paths:
-```bash
-rnpath --list
-```
-
-### Send a message:
-```bash
-rnpath -s "Hello!" <destination_hash>
-```
-
----
-
 ## Troubleshooting
 
 | Issue | Solution |
