@@ -15,6 +15,9 @@ from RNS.Interfaces.Interface import Interface
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
 
+    FLAG_UNFRAGMENTED = 0xFE
+    FLAG_FRAGMENTED = 0xFF
+
     # MAX_PACKET_PAYLOAD: https://github.com/meshcore-dev/MeshCore/blob/295f67d4fa4142b0701c9c7554f80a79b581e9a5/src/MeshCore.h#L19
     # Fragmentation: to fit within MAX_PACKET_PAYLOAD=184, 
     # reserve 5 bytes for fragment header -> payload 179 bytes
@@ -125,12 +128,10 @@ class MeshCoreInterface(Interface):
         
         return await self._meshcore_cls.create_ble()
 
-    def _fragment_outgoing(self, data: bytes):
-        # If packet is small, send as-is with flag 0x00
+    def _fragment_outgoing(self,  bytes):
         if len(data) <= self.FRAGMENT_MTU:
-            return [b'\x00' + data]
+            return [bytes([self.FLAG_UNFRAGMENTED]) + data]
         
-        # Fragment format: [0x01][frag_id:2][chunk_idx:1][total:1][payload:<=180]
         fragments = []
         frag_id = hashlib.md5(data).digest()[:2]
         total_chunks = (len(data) + self.FRAGMENT_MTU - 1) // self.FRAGMENT_MTU
@@ -140,7 +141,7 @@ class MeshCoreInterface(Interface):
             end = min(start + self.FRAGMENT_MTU, len(data))
             chunk = data[start:end]
             
-            header = b'\x01' + frag_id + bytes([idx, total_chunks])
+            header = bytes([self.FLAG_FRAGMENTED]) + frag_id + bytes([idx, total_chunks])
             fragments.append(header + chunk)
         
         return fragments
@@ -151,14 +152,12 @@ class MeshCoreInterface(Interface):
         
         flags = payload[0]
         
-        # Flag 0x00: not fragmented, return data directly
-        if flags == 0x00:
+        if flags == self.FLAG_UNFRAGMENTED:
             return payload[1:]
         
-        # Flag 0x01: fragmented packet
-        elif flags == 0x01:
+        elif flags == self.FLAG_FRAGMENTED:
             if len(payload) < 5:
-                RNS.log(f"[{self.name}] RX: fragment header too short", RNS.LOG_DEBUG)
+                RNS.log(f"[{self.name}] RX: fragment header too short", RNS.LOG_EXTREME)
                 return None
             
             frag_id = payload[1:3].hex()
@@ -167,14 +166,12 @@ class MeshCoreInterface(Interface):
             chunk_data = payload[5:]
             
             key = frag_id
-            
             if key not in self._fragment_meta:
                 self._fragment_meta[key] = {"total": total_chunks, "received": set()}
                 self._fragment_buffers[key] = {}
             
             meta = self._fragment_meta[key]
             buf = self._fragment_buffers[key]
-            
             buf[chunk_idx] = chunk_data
             meta["received"].add(chunk_idx)
             
@@ -183,9 +180,7 @@ class MeshCoreInterface(Interface):
                 del self._fragment_buffers[key]
                 del self._fragment_meta[key]
                 return assembled
-            
             return None
-        
         else:
             RNS.log(f"[{self.name}] RX: unknown fragment flag 0x{flags:02X}", RNS.LOG_EXTREME)
             return None
