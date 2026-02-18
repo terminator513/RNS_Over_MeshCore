@@ -15,9 +15,10 @@ from RNS.Interfaces.Interface import Interface
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
 
-    # Fragmentation: to fit within MAX_PACKET_PAYLOAD=184,
-    # reserve 4 bytes for fragment header -> payload 180 bytes
-    FRAGMENT_MTU = 179  # 184 - 5 байт заголовка = 179
+    # MAX_PACKET_PAYLOAD: https://github.com/meshcore-dev/MeshCore/blob/295f67d4fa4142b0701c9c7554f80a79b581e9a5/src/MeshCore.h#L19
+    # Fragmentation: to fit within MAX_PACKET_PAYLOAD=184, 
+    # reserve 5 bytes for fragment header -> payload 179 bytes
+    FRAGMENT_MTU = 179
     FRAGMENT_HEADER_SIZE = 4
 
     def __init__(self, owner, configuration):
