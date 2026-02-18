@@ -1,28 +1,37 @@
 # MeshCore Interface for Reticulum Network Stack
-# Implements internal fragmentation to respect MeshCore MAX_PACKET_PAYLOAD=184
+# Uses channel messages for reliable RNS transport with auto-configuration and fragmentation
 
 import asyncio
 import importlib.util
 import threading
 import time
 import hashlib
+import traceback
 from collections import defaultdict
 
 import RNS
 from RNS.Interfaces.Interface import Interface
 
 
+# =============================================================================
+# PRE-AGREED CHANNEL PARAMETERS (must match on all RNS nodes!)
+# =============================================================================
+RNS_CHANNEL_NAME = "RNSTunnel"
+RNS_CHANNEL_SECRET = bytes.fromhex("0123456789abcdef0123456789abcdef")  # 16 bytes
+RNS_CHANNEL_FALLBACK = 15  # Last valid channel if none free
+
+
+# =============================================================================
+# FRAGMENTATION PARAMETERS
+# =============================================================================
+FLAG_UNFRAGMENTED = 0xFE
+FLAG_FRAGMENTED = 0xFF
+FRAGMENT_MTU = 175  # Conservative for channel messages
+FRAGMENT_HEADER_SIZE = 5
+
+
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
-
-    FLAG_UNFRAGMENTED = 0xFE
-    FLAG_FRAGMENTED = 0xFF
-
-    # MAX_PACKET_PAYLOAD: https://github.com/meshcore-dev/MeshCore/blob/295f67d4fa4142b0701c9c7554f80a79b581e9a5/src/MeshCore.h#L19
-    # Fragmentation: to fit within MAX_PACKET_PAYLOAD=184, 
-    # reserve 5 bytes for fragment header -> payload 179 bytes
-    FRAGMENT_MTU = 179
-    FRAGMENT_HEADER_SIZE = 4
 
     def __init__(self, owner, configuration):
         if importlib.util.find_spec("meshcore") is None:
@@ -31,13 +40,22 @@ class MeshCoreInterface(Interface):
             RNS.panic()
 
         from meshcore import EventType, MeshCore
-        
-        
+
         super().__init__()
-        self.HW_MTU = 564
+        
+        # Config
         ifconf = Interface.get_config_obj(configuration)
         self.name = ifconf.get("name", "MeshCore")
         self.owner = owner
+        
+        # Allow overriding channel params via config
+        self.channel_name = ifconf.get("channel_name", RNS_CHANNEL_NAME)
+        secret_hex = ifconf.get("channel_secret", RNS_CHANNEL_SECRET.hex())
+        self.channel_secret = bytes.fromhex(secret_hex)
+        
+        # Channel will be auto-selected, but config can override
+        configured_idx = ifconf.get("channel_idx")
+        self.channel_idx = int(configured_idx) if configured_idx is not None else None
         
         self.transport = ifconf.get("transport", "ble").lower()
         self.port = ifconf.get("port", "/dev/ttyUSB0")
@@ -46,17 +64,21 @@ class MeshCoreInterface(Interface):
         self.tcp_port = int(ifconf.get("tcp_port", 4403))
         self.ble_name = ifconf.get("ble_name", None)
         
+        # Interface params
+        self.HW_MTU = 564
         self.bitrate = int(ifconf.get("bitrate", 2000))
         
+        # State
         self.online = False
         self.detached = False
         self._last_tx = 0
         self._lock = threading.Lock()
         
-        # Buffers for reassembling incoming fragments
+        # Fragmentation buffers
         self._fragment_buffers = defaultdict(dict)
         self._fragment_meta = {}
         
+        # MeshCore refs
         self._meshcore_cls = MeshCore
         self._event_type_cls = EventType
         self.mesh = None
@@ -83,8 +105,99 @@ class MeshCoreInterface(Interface):
             except Exception as e:
                 with self._lock:
                     self.online = False
-                RNS.log(f"[{self.name}] MeshCore connect failed: {e}", RNS.LOG_ERROR)
+                RNS.log(f"[{self.name}] MeshCore connect failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
                 await asyncio.sleep(3)
+
+    async def _find_free_channel(self):
+        """
+        Search for a free channel (0-15).
+        Returns channel index if found, or None if all are occupied.
+        A channel is "free" if it doesn't exist or has different config we can overwrite.
+        """
+        # If config specifies exact channel, try only that one
+        if self.channel_idx is not None:
+            idx = self.channel_idx
+            if not 0 <= idx <= 15:
+                RNS.log(f"[{self.name}] Configured channel {idx} out of range (0-15)", RNS.LOG_ERROR)
+                return None
+            
+            result = await self.mesh.commands.get_channel(idx)
+            if result.type == self._event_type_cls.CHANNEL_INFO:
+                payload = result.payload
+                if (payload.get("channel_name") == self.channel_name and 
+                    payload.get("channel_secret") == self.channel_secret):
+                    RNS.log(f"[{self.name}] Channel {idx} already configured correctly", RNS.LOG_INFO)
+                    return idx
+            # Try to claim it
+            set_result = await self.mesh.commands.set_channel(idx, self.channel_name, self.channel_secret)
+            if set_result.type == self._event_type_cls.OK:
+                RNS.log(f"[{self.name}] Claimed configured channel {idx}", RNS.LOG_INFO)
+                return idx
+            RNS.log(f"[{self.name}] Failed to claim configured channel {idx}", RNS.LOG_DEBUG)
+            return None
+        
+        # Auto-search: try channels 0-15, prefer higher indices to avoid common channels
+        for idx in reversed(range(16)):  # 15, 14, 13, ... 0
+            try:
+                result = await self.mesh.commands.get_channel(idx)
+                
+                if result.type == self._event_type_cls.CHANNEL_INFO:
+                    payload = result.payload
+                    # Check if already configured for us
+                    if (payload.get("channel_name") == self.channel_name and 
+                        payload.get("channel_secret") == self.channel_secret):
+                        RNS.log(f"[{self.name}] Found our channel {idx}", RNS.LOG_INFO)
+                        return idx
+                    # Channel exists with different config - skip, don't overwrite others
+                    RNS.log(f"[{self.name}] Channel {idx} occupied by other config, skipping", RNS.LOG_DEBUG)
+                    continue
+                
+                # Channel doesn't exist or error - try to claim it
+                set_result = await self.mesh.commands.set_channel(idx, self.channel_name, self.channel_secret)
+                if set_result.type == self._event_type_cls.OK:
+                    RNS.log(f"[{self.name}] Claimed free channel {idx}", RNS.LOG_INFO)
+                    return idx
+                RNS.log(f"[{self.name}] Failed to claim channel {idx}: {set_result.payload}", RNS.LOG_DEBUG)
+                
+            except Exception as e:
+                RNS.log(f"[{self.name}] Error checking channel {idx}: {e}", RNS.LOG_DEBUG)
+                continue
+        
+        # No free channel found
+        RNS.log(f"[{self.name}] No free channel found (0-15)", RNS.LOG_WARNING)
+        return None
+
+    async def _ensure_channel(self):
+        """Find and configure a channel for RNS traffic"""
+        # Validate secret length
+        if len(self.channel_secret) != 16:
+            RNS.log(f"[{self.name}] Invalid secret length {len(self.channel_secret)} (must be 16 bytes)", RNS.LOG_ERROR)
+            return False
+        
+        # Find or claim a channel
+        channel = await self._find_free_channel()
+        
+        if channel is not None:
+            self.channel_idx = channel
+            RNS.log(f"[{self.name}] Using channel {self.channel_idx}", RNS.LOG_INFO)
+            return True
+        
+        # Fallback: try to use the last channel anyway
+        fallback = RNS_CHANNEL_FALLBACK
+        RNS.log(f"[{self.name}] Falling back to channel {fallback}", RNS.LOG_WARNING)
+        
+        try:
+            result = await self.mesh.commands.set_channel(fallback, self.channel_name, self.channel_secret)
+            if result.type == self._event_type_cls.OK:
+                self.channel_idx = fallback
+                RNS.log(f"[{self.name}] Fallback channel {fallback} configured", RNS.LOG_INFO)
+                return True
+            else:
+                RNS.log(f"[{self.name}] Failed to configure fallback channel: {result.payload}", RNS.LOG_ERROR)
+                return False
+        except Exception as e:
+            RNS.log(f"[{self.name}] Error configuring fallback channel: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
+            return False
 
     async def _connect_once(self):
         if self.transport == "serial":
@@ -99,14 +212,19 @@ class MeshCoreInterface(Interface):
         if self.mesh is None:
             raise IOError("MeshCore returned no connection object")
 
-        self.mesh.subscribe(self._event_type_cls.RX_LOG_DATA, self._rx)
+        # Ensure channel is configured
+        if not await self._ensure_channel():
+            raise IOError("Failed to configure any channel for RNS")
+
+        # Subscribe to channel messages
+        self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
 
         with self._lock:
             self.online = True
         
-        RNS.log(f"[{self.name}] MeshCore connected over {self.transport}", RNS.LOG_INFO)
+        RNS.log(f"[{self.name}] MeshCore connected over {self.transport} (channel={self.channel_idx})", RNS.LOG_INFO)
 
     async def _open_ble_mesh(self):
         if self.ble_name:
@@ -117,8 +235,7 @@ class MeshCoreInterface(Interface):
 
             RNS.log(f"[{self.name}] Scanning for BLE device '{self.ble_name}'...", RNS.LOG_INFO)
             devices = await BleakScanner.discover(timeout=5.0)
-            RNS.log(f"[{self.name}] Detected devices: {devices}", RNS.LOG_DEBUG)
-
+            
             for device in devices:
                 if device.name == self.ble_name:
                     RNS.log(f"[{self.name}] Found {self.ble_name} @ {device.address}", RNS.LOG_INFO)
@@ -128,118 +245,111 @@ class MeshCoreInterface(Interface):
         
         return await self._meshcore_cls.create_ble()
 
-    def _fragment_outgoing(self,  bytes):
-        if len(data) <= self.FRAGMENT_MTU:
-            return [bytes([self.FLAG_UNFRAGMENTED]) + data]
+    def _fragment_outgoing(self, data):
+        """Split large packets into fragments"""
+        if len(data) <= FRAGMENT_MTU:
+            return [bytes([FLAG_UNFRAGMENTED]) + data]
         
         fragments = []
         frag_id = hashlib.md5(data).digest()[:2]
-        total_chunks = (len(data) + self.FRAGMENT_MTU - 1) // self.FRAGMENT_MTU
+        total_chunks = (len(data) + FRAGMENT_MTU - 1) // FRAGMENT_MTU
         
         for idx in range(total_chunks):
-            start = idx * self.FRAGMENT_MTU
-            end = min(start + self.FRAGMENT_MTU, len(data))
+            start = idx * FRAGMENT_MTU
+            end = min(start + FRAGMENT_MTU, len(data))
             chunk = data[start:end]
             
-            header = bytes([self.FLAG_FRAGMENTED]) + frag_id + bytes([idx, total_chunks])
+            header = bytes([FLAG_FRAGMENTED]) + frag_id + bytes([idx, total_chunks])
             fragments.append(header + chunk)
         
         return fragments
 
-    def _reassemble_incoming(self, payload: bytes):
-        if len(payload) < 1:
+    def _reassemble_fragment(self, payload: bytes):
+        """Reassemble fragments. Returns None if not all received yet."""
+        if len(payload) < 5:
             return None
         
-        flags = payload[0]
+        frag_id = payload[0:2].hex()
+        chunk_idx = payload[2]
+        total_chunks = payload[3]
+        chunk_data = payload[4:]
         
-        if flags == self.FLAG_UNFRAGMENTED:
-            return payload[1:]
+        key = frag_id
+        if key not in self._fragment_meta:
+            self._fragment_meta[key] = {"total": total_chunks, "received": set()}
+            self._fragment_buffers[key] = {}
         
-        elif flags == self.FLAG_FRAGMENTED:
-            if len(payload) < 5:
-                RNS.log(f"[{self.name}] RX: fragment header too short", RNS.LOG_EXTREME)
-                return None
-            
-            frag_id = payload[1:3].hex()
-            chunk_idx = payload[3]
-            total_chunks = payload[4]
-            chunk_data = payload[5:]
-            
-            key = frag_id
-            if key not in self._fragment_meta:
-                self._fragment_meta[key] = {"total": total_chunks, "received": set()}
-                self._fragment_buffers[key] = {}
-            
-            meta = self._fragment_meta[key]
-            buf = self._fragment_buffers[key]
-            buf[chunk_idx] = chunk_data
-            meta["received"].add(chunk_idx)
-            
-            if len(meta["received"]) == meta["total"]:
-                assembled = b''.join(buf[i] for i in range(meta["total"]))
-                del self._fragment_buffers[key]
-                del self._fragment_meta[key]
-                return assembled
-            return None
-        else:
-            RNS.log(f"[{self.name}] RX: unknown fragment flag 0x{flags:02X}", RNS.LOG_EXTREME)
-            return None
+        meta = self._fragment_meta[key]
+        buf = self._fragment_buffers[key]
+        buf[chunk_idx] = chunk_data
+        meta["received"].add(chunk_idx)
+        
+        if len(meta["received"]) == meta["total"]:
+            assembled = b''.join(buf[i] for i in range(meta["total"]))
+            del self._fragment_buffers[key]
+            del self._fragment_meta[key]
+            return assembled
+        return None
 
     async def _rx(self, event):
         try:
-            payload = None
+            if event.type != self._event_type_cls.CHANNEL_MSG_RECV:
+                return
             
-            if event and hasattr(event, "payload") and event.payload:
-                evt_payload = event.payload
-                
-                if isinstance(evt_payload, dict):
-                    raw = evt_payload.get("payload")
-                    
-                    if isinstance(raw, str):
-                        payload = bytes.fromhex(raw.replace(" ", ""))
-                    elif isinstance(raw, (bytes, bytearray)):
-                        payload = bytes(raw)
-                    
-                elif isinstance(evt_payload, (bytes, bytearray)):
-                    payload = bytes(evt_payload)
+            payload = event.payload
+            if not isinstance(payload, dict):
+                return
             
-            if payload and len(payload) > 0:
-                RNS.log(f"[{self.name}] RX: raw payload len={len(payload)}, first 16 bytes = {payload[:16].hex()}", RNS.LOG_EXTREME)
-                # Попробуем интерпретировать как meshcore-пакет
-                if len(payload) >= 1:
-                    header = payload[0]
-                    route_type = header & 0x03
-                    payload_type = (header >> 2) & 0x0F
-                    version = (header >> 6) & 0x03
-                    RNS.log(f"[{self.name}] RX: meshcore header? V={version}, P={payload_type}, R={route_type}", RNS.LOG_EXTREME)
-                assembled = self._reassemble_incoming(payload)
-                
-                if assembled is None:
-                    return
-                
-                with self._lock:
-                    self.rxb += len(assembled)
-                self.owner.inbound(assembled, self)
+            if payload.get("channel_idx") != self.channel_idx:
+                return
+            
+            msg_str = payload.get("message")
+            if not msg_str:
+                return
+            
+            data = msg_str.encode('latin-1')
+            
+            if len(data) < 1:
+                return
+            
+            flags = data[0]
+            mesh_payload = data[1:]
+            
+            if flags == FLAG_UNFRAGMENTED:
+                assembled = mesh_payload
+            elif flags == FLAG_FRAGMENTED:
+                assembled = self._reassemble_fragment(mesh_payload)
             else:
-                RNS.log(f"[{self.name}] RX: empty or unparsable payload", RNS.LOG_DEBUG)
-                
+                return
+            
+            if assembled is None:
+                return
+            
+            with self._lock:
+                self.rxb += len(assembled)
+            self.owner.inbound(assembled, self)
+            
         except Exception as e:
-            RNS.log(f"[{self.name}] RX error: {e}", RNS.LOG_ERROR)
+            RNS.log(f"[{self.name}] RX error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
 
     async def _err(self, event):
-        with self._lock:
-            self.online = False
+        try:
+            event_payload = event.payload if event and hasattr(event, "payload") else "unknown"
             
-        event_payload = "unknown"
-        if event and hasattr(event, "payload"):
-            event_payload = event.payload
-        elif event:
-            event_payload = str(event)
+            if (
+                isinstance(event_payload, dict) 
+                and event_payload.get("error_code") in (1, 2)
+                and self.transport == "ble"
+            ):
+                RNS.log(f"[{self.name}] Transient BLE error (code={event_payload.get('error_code')}), keeping connection", RNS.LOG_DEBUG)
+                return
             
-        RNS.log(f"[{self.name}] MeshCore event error/disconnect: {event_payload}", RNS.LOG_ERROR)
-        
-        if not self.detached and self.loop and self.loop.is_running():
-            self.loop.create_task(self._connect_loop())
+            RNS.log(f"[{self.name}] MeshCore event error: {event_payload}", RNS.LOG_ERROR)
+            
+            with self._lock:
+                self.online = False
+        except Exception as e:
+            RNS.log(f"[{self.name}] _err handler error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
 
     def process_outgoing(self, data):
         with self._lock:
@@ -250,7 +360,7 @@ class MeshCoreInterface(Interface):
         
         now = time.time()
         
-        for fragment in fragments:
+        for i, fragment in enumerate(fragments):
             if self.bitrate > 0:
                 min_interval = len(fragment) / self.bitrate
                 elapsed = now - self._last_tx
@@ -258,6 +368,13 @@ class MeshCoreInterface(Interface):
                     time.sleep(min_interval - elapsed)
                     now = time.time()
             self._last_tx = now
+
+            if self.transport == "ble" and i > 0:
+                ble_delay = 0.1
+                elapsed = time.time() - now
+                if elapsed < ble_delay:
+                    time.sleep(ble_delay - elapsed)
+                now = time.time()
 
             with self._lock:
                 self.txb += len(fragment)
@@ -268,18 +385,23 @@ class MeshCoreInterface(Interface):
                 try:
                     fut.result()
                 except Exception as e:
-                    RNS.log(f"[{self.name}] TX async error: {e}", RNS.LOG_ERROR)
+                    RNS.log(f"[{self.name}] TX async error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
                     with self._lock:
                         self.online = False
             
             future.add_done_callback(_tx_callback)
 
     async def _send(self, data):
+        """Send RNS packet as channel message"""
         try:
-            RNS.log(f"[{self.name}] TX: calling mesh.commands.send({len(data)} bytes)", RNS.LOG_DEBUG)
-            await self.mesh.commands.send(data)
+            msg_str = data.decode('latin-1')
+            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+            
+            if result.type == self._event_type_cls.ERROR:
+                RNS.log(f"[{self.name}] TX channel error: {result.payload}", RNS.LOG_DEBUG)
+                
         except Exception as e:
-            RNS.log(f"[{self.name}] TX failed: {e}", RNS.LOG_ERROR)
+            RNS.log(f"[{self.name}] TX failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
             raise
 
     def should_ingress_limit(self):
@@ -295,7 +417,8 @@ class MeshCoreInterface(Interface):
             location = self.ble_name or "BLE:auto"
         else:
             location = "unknown"
-        return f"{self.name}: {status}, {self.transport}://{location}, MTU={self.HW_MTU} (frag={self.FRAGMENT_MTU})"
+        chan_str = f"{self.channel_idx}" if self.channel_idx is not None else "auto"
+        return f"{self.name}: {status}, {self.transport}://{location}, channel={chan_str}, MTU={self.HW_MTU} (frag={FRAGMENT_MTU})"
 
     def detach(self):
         self.detached = True
@@ -306,13 +429,13 @@ class MeshCoreInterface(Interface):
         if self.loop and self.loop.is_running():
             if self.mesh:
                 try:
-                    asyncio.run_coroutine_threadsafe(self.mesh.close(), self.loop)
-                except:
-                    pass
+                    asyncio.run_coroutine_threadsafe(self.mesh.disconnect(), self.loop)
+                except Exception as e:
+                    RNS.log(f"[{self.name}] detach disconnect error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
             try:
                 self.loop.call_soon_threadsafe(self.loop.stop)
-            except:
-                pass
+            except Exception as e:
+                RNS.log(f"[{self.name}] detach loop stop error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
         
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
