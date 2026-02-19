@@ -8,16 +8,17 @@ import time
 import hashlib
 import traceback
 from collections import defaultdict
+from typing import Optional
 
 import RNS
 from RNS.Interfaces.Interface import Interface
-
+from meshcore.events import Event
 
 # =============================================================================
 # PRE-AGREED CHANNEL PARAMETERS (must match on all RNS nodes!)
 # =============================================================================
 RNS_CHANNEL_NAME = "RNSTunnel"
-RNS_CHANNEL_SECRET = bytes.fromhex("c4d2b6c8254e3b11200f57e95dcb1197")  #DON'T USE THIS PUBLIC KEY, YOU WILL RUIN OTHER PEOPLE'S LIVES = 8b3387e9c5cdea6ac9e5edbaa115cd72
+RNS_CHANNEL_SECRET = bytes.fromhex("c4d2b6c8254e3b11200f57e95dcb1197") #DON'T USE THIS PUBLIC KEY, YOU WILL RUIN OTHER PEOPLE'S LIVES = 8b3387e9c5cdea6ac9e5edbaa115cd72
 RNS_CHANNEL_MAX = 39  # Firmware supports channels 0-39
 RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 
@@ -30,7 +31,6 @@ FLAG_FRAGMENTED = 0xFF
 FRAGMENT_MTU = 160
 FRAGMENT_HEADER_SIZE = 5
 
-
 class MeshCoreInterface(Interface):
     DEFAULT_IFAC_SIZE = 8
 
@@ -41,7 +41,7 @@ class MeshCoreInterface(Interface):
             RNS.panic()
 
         from meshcore import EventType, MeshCore
-
+        from meshcore.events import Event
         super().__init__()
         
         # Config
@@ -49,12 +49,10 @@ class MeshCoreInterface(Interface):
         self.name = ifconf.get("name", "MeshCore")
         self.owner = owner
         
-        # Allow overriding channel params via config
         self.channel_name = ifconf.get("channel_name", RNS_CHANNEL_NAME)
         secret_hex = ifconf.get("channel_secret", RNS_CHANNEL_SECRET.hex())
         self.channel_secret = bytes.fromhex(secret_hex)
         
-        # Channel will be auto-selected, but config can override
         configured_idx = ifconf.get("channel_idx")
         self.channel_idx = int(configured_idx) if configured_idx is not None else None
         
@@ -67,7 +65,9 @@ class MeshCoreInterface(Interface):
         
         # Interface params
         self.HW_MTU = 564
-        self.bitrate = int(ifconf.get("bitrate", 2000))
+        self.bitrate = int(ifconf.get("bitrate", 500))
+        # 🔑 Задержка между фрагментами в секундах (по умолчанию 0.1 = 100 мс)
+        self.fragment_delay = float(ifconf.get("fragment_delay", 0))
         
         # State
         self.online = False
@@ -78,11 +78,14 @@ class MeshCoreInterface(Interface):
         # Fragmentation buffers
         self._fragment_buffers = defaultdict(dict)
         self._fragment_meta = {}
-        self._fragment_timestamps = {}  # {key: timestamp}
+        self._fragment_timestamps = {}
         
         # MeshCore refs
         self._meshcore_cls = MeshCore
         self._event_type_cls = EventType
+        #global _event_cls
+        #self._event_cls = Event
+
         self.mesh = None
         self.loop = None
         self.thread = None
@@ -111,11 +114,6 @@ class MeshCoreInterface(Interface):
                 await asyncio.sleep(3)
 
     async def _find_free_channel(self):
-        """
-        Search for a free channel (0-39).
-        A channel is "free" if it has empty name and zero secret.
-        """
-        # If config specifies exact channel, try only that one
         if self.channel_idx is not None:
             idx = self.channel_idx
             if not 0 <= idx <= RNS_CHANNEL_MAX:
@@ -129,7 +127,6 @@ class MeshCoreInterface(Interface):
                     payload.get("channel_secret") == self.channel_secret):
                     RNS.log(f"[{self.name}] Channel {idx} already configured correctly", RNS.LOG_INFO)
                     return idx
-            # Try to claim it
             set_result = await self.mesh.commands.set_channel(idx, self.channel_name, self.channel_secret)
             if set_result.type == self._event_type_cls.OK:
                 RNS.log(f"[{self.name}] Claimed configured channel {idx}", RNS.LOG_INFO)
@@ -137,8 +134,7 @@ class MeshCoreInterface(Interface):
             RNS.log(f"[{self.name}] Failed to claim configured channel {idx}", RNS.LOG_DEBUG)
             return None
         
-        # Auto-search: try channels 0-39, prefer higher indices to avoid common channels
-        for idx in reversed(range(RNS_CHANNEL_MAX + 1)):  # 39, 38, 37, ... 0
+        for idx in reversed(range(RNS_CHANNEL_MAX + 1)):
             try:
                 result = await self.mesh.commands.get_channel(idx)
                 
@@ -147,25 +143,20 @@ class MeshCoreInterface(Interface):
                     name = payload.get("channel_name", "")
                     secret = payload.get("channel_secret", b"")
                     
-                    # Check if already configured for us
                     if name == self.channel_name and secret == self.channel_secret:
                         RNS.log(f"[{self.name}] Found our channel {idx}", RNS.LOG_INFO)
                         return idx
                     
-                    # Check if channel is free (empty name + zero secret)
                     if name == "" and secret == bytes(16):
-                        # Try to claim it
                         set_result = await self.mesh.commands.set_channel(idx, self.channel_name, self.channel_secret)
                         if set_result.type == self._event_type_cls.OK:
                             RNS.log(f"[{self.name}] Claimed free channel {idx}", RNS.LOG_INFO)
                             return idx
                         RNS.log(f"[{self.name}] Failed to claim free channel {idx}", RNS.LOG_DEBUG)
                     else:
-                        # Channel occupied by other config - skip
                         RNS.log(f"[{self.name}] Channel {idx} occupied, skipping", RNS.LOG_DEBUG)
                     continue
                 
-                # Error response - try to claim anyway
                 set_result = await self.mesh.commands.set_channel(idx, self.channel_name, self.channel_secret)
                 if set_result.type == self._event_type_cls.OK:
                     RNS.log(f"[{self.name}] Claimed channel {idx}", RNS.LOG_INFO)
@@ -175,18 +166,14 @@ class MeshCoreInterface(Interface):
                 RNS.log(f"[{self.name}] Error checking channel {idx}: {e}", RNS.LOG_DEBUG)
                 continue
         
-        # No free channel found
         RNS.log(f"[{self.name}] No free channel found (0-{RNS_CHANNEL_MAX})", RNS.LOG_WARNING)
         return None
 
     async def _ensure_channel(self):
-        """Find and configure a channel for RNS traffic"""
-        # Validate secret length
         if len(self.channel_secret) != 16:
             RNS.log(f"[{self.name}] Invalid secret length {len(self.channel_secret)} (must be 16 bytes)", RNS.LOG_ERROR)
             return False
         
-        # Find or claim a channel
         channel = await self._find_free_channel()
         
         if channel is not None:
@@ -194,7 +181,6 @@ class MeshCoreInterface(Interface):
             RNS.log(f"[{self.name}] Using channel {self.channel_idx}", RNS.LOG_INFO)
             return True
         
-        # Fallback: try to use the last channel anyway
         fallback = RNS_CHANNEL_FALLBACK
         RNS.log(f"[{self.name}] Falling back to channel {fallback}", RNS.LOG_WARNING)
         
@@ -224,21 +210,15 @@ class MeshCoreInterface(Interface):
         if self.mesh is None:
             raise IOError("MeshCore returned no connection object")
 
-        # Ensure channel is configured
         if not await self._ensure_channel():
             raise IOError("Failed to configure any channel for RNS")
 
-        # Subscribe to channel messages
-        #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx)
-        #self.mesh.subscribe(self._event_type_cls.RX_LOG_DATA, self._rx)
-
-
         self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
-        #self.mesh.subscribe(self._event_type_cls.CONTACT_MSG_RECV, self._rx)
-
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
+        
         await self.mesh.start_auto_message_fetching()
+        
         with self._lock:
             self.online = True
         
@@ -269,13 +249,13 @@ class MeshCoreInterface(Interface):
         
         fragments = []
         frag_id_bytes = hashlib.md5(data).digest()[:2]
-        frag_id_key = frag_id_bytes.hex()
         total_chunks = (len(data) + FRAGMENT_MTU - 1) // FRAGMENT_MTU
         
         for idx in range(total_chunks):
             start = idx * FRAGMENT_MTU
             end = min(start + FRAGMENT_MTU, len(data))
             chunk = data[start:end]
+            
             header = bytes([FLAG_FRAGMENTED]) + frag_id_bytes + bytes([idx, total_chunks])
             fragments.append(header + chunk)
         
@@ -315,6 +295,7 @@ class MeshCoreInterface(Interface):
                 RNS.log(f"[{self.name}] RX frag: missing chunks {missing}", RNS.LOG_DEBUG)
                 return None
         return None
+
     async def _rx(self, event):
         try:
             now = time.time()
@@ -342,8 +323,8 @@ class MeshCoreInterface(Interface):
             msg_str = payload.get("text")
             if not msg_str:
                 return
-            msg_str = self.remove_node_name_from_msg(msg_str)
-            print(msg_str)
+            msg_str = self._remove_node_name_from_msg(msg_str)
+            
             data = msg_str.encode('latin-1')
             
             if len(data) < 1:
@@ -398,45 +379,71 @@ class MeshCoreInterface(Interface):
         now = time.time()
         
         for i, fragment in enumerate(fragments):
+            # Rate limiting по bitrate
             if self.bitrate > 0:
                 min_interval = len(fragment) / self.bitrate
                 elapsed = now - self._last_tx
                 if elapsed < min_interval:
-                    time.sleep(min_interval - elapsed)
+                    #time.sleep(min_interval - elapsed)
                     now = time.time()
             self._last_tx = now
 
-            if self.transport == "ble" and i > 0:
-                ble_delay = 0.1
-                elapsed = time.time() - now
-                if elapsed < ble_delay:
-                    time.sleep(ble_delay - elapsed)
-                now = time.time()
+            
 
             with self._lock:
                 self.txb += len(fragment)
 
-            future = asyncio.run_coroutine_threadsafe(self._send(fragment), self.loop)
-            
-            def _tx_callback(fut):
+            # 🔑 Callback для обработки ошибок
+            def _tx_callback(fut, frag_num=i+1):
                 try:
                     fut.result()
                 except Exception as e:
-                    RNS.log(f"[{self.name}] TX async error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
+                    RNS.log(f"[{self.name}] TX async error on fragment {frag_num}: {e}", RNS.LOG_ERROR)
                     with self._lock:
                         self.online = False
             
-            future.add_done_callback(_tx_callback)
-
+            # 🔑 Отправляем асинхронно
+            if not self.detached and self.loop and self.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(self._send(fragment), self.loop)
+                future.add_done_callback(_tx_callback)
+            
+            # 🔑 Задержка между фрагментами (синхронная)
+            if self.fragment_delay > 0:
+                time.sleep(self.fragment_delay)
+                now = time.time()
+    async def _send_channel_raw(self, channel_idx: int, data: bytes, timestamp: Optional[int] = None) -> Event:
+        """
+        Отправляет сырые байты в канал MeshCore, минуя utf-8 кодирование.
+        """
+        if timestamp is None:
+            import time
+            timestamp_bytes = int(time.time()).to_bytes(4, "little")
+        elif isinstance(timestamp, int):
+            timestamp_bytes = timestamp.to_bytes(4, "little")
+        else:
+            import time
+            timestamp_bytes = int(time.time()).to_bytes(4, "little")
+        
+        packet = (
+            b"\x03\x00" +
+            channel_idx.to_bytes(1, "little") +
+            timestamp_bytes +
+            data
+        )
+        
+        return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
+    
     async def _send(self, data):
         """Send RNS packet as channel message"""
         try:
             msg_str = data.decode('latin-1')
-            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+            result = await self._send_channel_raw(self.channel_idx, data)
             
             if result.type == self._event_type_cls.ERROR:
-                RNS.log(f"[{self.name}] TX channel error: {result.payload}", RNS.LOG_ERROR)
-            #RNS.log(f"[{self.name}] TX result.type: {result.type}", RNS.LOG_DEBUG)
+                RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
+            RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
+            RNS.log(f"[{self.name}] TX data: {msg_str}", RNS.LOG_DEBUG)
+            
                 
         except Exception as e:
             RNS.log(f"[{self.name}] TX failed: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
@@ -479,17 +486,15 @@ class MeshCoreInterface(Interface):
             self.thread.join(timeout=2.0)
         
         RNS.log(f"[{self.name}] Detached", RNS.LOG_INFO)
-    def remove_node_name_from_msg(self, text: str):
-        original_text = text  # сохраним для возможного fallback
-        # Разбиваем по разделителю ": " (все вхождения), удаляем первую часть,
-        # потом соединяем оставшиеся частями через ": " обратно.
+
+    def _remove_node_name_from_msg(self, text: str):
+        original_text = text
         parts = original_text.split(": ")
         if len(parts) >= 2:
             new_text = ": ".join(parts[1:]).strip()
             if new_text:
                 text = new_text
             else:
-                # fallback к оригиналу
                 text = original_text
         return text
 
