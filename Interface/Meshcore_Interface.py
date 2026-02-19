@@ -63,7 +63,7 @@ class MeshCoreInterface(Interface):
         self.host = ifconf.get("host", "127.0.0.1")
         self.tcp_port = int(ifconf.get("tcp_port", 4403))
         self.ble_name = ifconf.get("ble_name", None)
-        self.count_repeat = ifconf.get("count_repeat", 8)
+        self.count_repeat = ifconf.get("count_repeat", 6)
         
         # Interface params
         self.HW_MTU = 564
@@ -217,7 +217,7 @@ class MeshCoreInterface(Interface):
 
         #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx_raw)
 
-        #self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
+        self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
         
