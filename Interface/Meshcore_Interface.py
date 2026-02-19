@@ -229,10 +229,16 @@ class MeshCoreInterface(Interface):
             raise IOError("Failed to configure any channel for RNS")
 
         # Subscribe to channel messages
+        #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx)
+        #self.mesh.subscribe(self._event_type_cls.RX_LOG_DATA, self._rx)
+
+
         self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
+        #self.mesh.subscribe(self._event_type_cls.CONTACT_MSG_RECV, self._rx)
+
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
-
+        await self.mesh.start_auto_message_fetching()
         with self._lock:
             self.online = True
         
@@ -304,7 +310,6 @@ class MeshCoreInterface(Interface):
             del self._fragment_timestamps[key]
             return assembled
         return None
-
     async def _rx(self, event):
         try:
             now = time.time()
@@ -318,7 +323,7 @@ class MeshCoreInterface(Interface):
                     self._fragment_buffers.pop(key, None)
                     self._fragment_meta.pop(key, None)
                     self._fragment_timestamps.pop(key, None)
-            
+
             if event.type != self._event_type_cls.CHANNEL_MSG_RECV:
                 return
             
