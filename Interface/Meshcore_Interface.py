@@ -213,6 +213,8 @@ class MeshCoreInterface(Interface):
         if not await self._ensure_channel():
             raise IOError("Failed to configure any channel for RNS")
 
+        #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx_raw)
+
         self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
@@ -295,8 +297,7 @@ class MeshCoreInterface(Interface):
                 RNS.log(f"[{self.name}] RX frag: missing chunks {missing}", RNS.LOG_DEBUG)
                 return None
         return None
-
-    async def _rx(self, event):
+    async def _rx_raw(self, event):
         try:
             now = time.time()
             with self._lock:
@@ -310,8 +311,44 @@ class MeshCoreInterface(Interface):
                     self._fragment_meta.pop(key, None)
                     self._fragment_timestamps.pop(key, None)
 
-            if event.type != self._event_type_cls.CHANNEL_MSG_RECV:
+            print(event)
+            data = event.payload
+            
+            if len(data) < 1:
                 return
+            
+            flags = data[0]
+            mesh_payload = data[1:]
+            
+            if flags == FLAG_UNFRAGMENTED:
+                assembled = mesh_payload
+            elif flags == FLAG_FRAGMENTED:
+                assembled = self._reassemble_fragment(mesh_payload)
+            else:
+                return
+            
+            if assembled is None:
+                return
+            
+            with self._lock:
+                self.rxb += len(assembled)
+            self.owner.inbound(assembled, self)
+            
+        except Exception as e:
+            RNS.log(f"[{self.name}] RX error: {e}\n{traceback.format_exc()}", RNS.LOG_ERROR)
+    async def _rx(self, event):
+        try:
+            now = time.time()
+            with self._lock:
+                expired_keys = [
+                    key for key, ts in self._fragment_timestamps.items()
+                    if now - ts > 30
+                ]
+                for key in expired_keys:
+                    RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
+                    self._fragment_buffers.pop(key, None)
+                    self._fragment_meta.pop(key, None)
+                    self._fragment_timestamps.pop(key, None)
             
             payload = event.payload
             if not isinstance(payload, dict):
@@ -324,7 +361,7 @@ class MeshCoreInterface(Interface):
             if not msg_str:
                 return
             msg_str = self._remove_node_name_from_msg(msg_str)
-            
+            #print(f"DEBUG {msg_str}")
             data = msg_str.encode('latin-1')
             
             if len(data) < 1:
@@ -411,7 +448,7 @@ class MeshCoreInterface(Interface):
             if self.fragment_delay > 0:
                 time.sleep(self.fragment_delay)
                 now = time.time()
-    async def _send_channel_raw(self, channel_idx: int, data: bytes, timestamp: Optional[int] = None) -> Event:
+    async def _send_channel_raw(self, channel_idx: int, msg: str, timestamp: Optional[int] = None) -> Event:
         """
         Отправляет сырые байты в канал MeshCore, минуя utf-8 кодирование.
         """
@@ -428,6 +465,17 @@ class MeshCoreInterface(Interface):
             b"\x03\x00" +
             channel_idx.to_bytes(1, "little") +
             timestamp_bytes +
+            msg.encode("latin-1")
+        )
+        
+        return await self.mesh.commands.send(packet, [self._event_type_cls.OK, self._event_type_cls.ERROR])
+    async def _send_raw(self, data: bytes) -> Event:
+        """
+        Отправляет сырые байты в эфир
+        """
+        
+        packet = (
+            b"\x19\x00" +
             data
         )
         
@@ -437,8 +485,10 @@ class MeshCoreInterface(Interface):
         """Send RNS packet as channel message"""
         try:
             msg_str = data.decode('latin-1')
-            result = await self._send_channel_raw(self.channel_idx, data)
-            
+            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+            #result = await self._send_channel_raw(self.channel_idx, msg_str)
+            #result = await self._send_raw(data)
+
             if result.type == self._event_type_cls.ERROR:
                 RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
             RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
