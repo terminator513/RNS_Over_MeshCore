@@ -29,7 +29,7 @@ RNS_CHANNEL_FALLBACK = 39  # Last valid channel if none free
 # =============================================================================
 FLAG_UNFRAGMENTED = 0xFE
 FLAG_FRAGMENTED = 0xFF
-FRAGMENT_MTU = 120
+FRAGMENT_MTU = 100
 FRAGMENT_HEADER_SIZE = 5
 
 class MeshCoreInterface(Interface):
@@ -63,12 +63,13 @@ class MeshCoreInterface(Interface):
         self.host = ifconf.get("host", "127.0.0.1")
         self.tcp_port = int(ifconf.get("tcp_port", 4403))
         self.ble_name = ifconf.get("ble_name", None)
+        self.count_repeat = ifconf.get("count_repeat", 8)
         
         # Interface params
         self.HW_MTU = 564
         self.bitrate = int(ifconf.get("bitrate", 2000))
         # 🔑 Задержка между фрагментами в секундах (по умолчанию 0.1 = 100 мс)
-        self.fragment_delay = float(ifconf.get("fragment_delay", 0))
+        self.fragment_delay = float(ifconf.get("fragment_delay", 20))
         
         # State
         self.online = False
@@ -216,7 +217,7 @@ class MeshCoreInterface(Interface):
 
         #self.mesh.subscribe(self._event_type_cls.RAW_DATA, self._rx_raw)
 
-        self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
+        #self.mesh.subscribe(self._event_type_cls.CHANNEL_MSG_RECV, self._rx)
         self.mesh.subscribe(self._event_type_cls.ERROR, self._err)
         self.mesh.subscribe(self._event_type_cls.DISCONNECTED, self._err)
         
@@ -304,7 +305,7 @@ class MeshCoreInterface(Interface):
             with self._lock:
                 expired_keys = [
                     key for key, ts in self._fragment_timestamps.items()
-                    if now - ts > 30
+                    if now - ts > 180
                 ]
                 for key in expired_keys:
                     RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
@@ -343,7 +344,7 @@ class MeshCoreInterface(Interface):
             with self._lock:
                 expired_keys = [
                     key for key, ts in self._fragment_timestamps.items()
-                    if now - ts > 30
+                    if now - ts > 180
                 ]
                 for key in expired_keys:
                     RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
@@ -364,9 +365,9 @@ class MeshCoreInterface(Interface):
             msg_str = self._remove_node_name_from_msg(msg_str)
             #print(f"DEBUG {msg_str}")
             try:
-                data = base64.b64decode(msg_str)
-            except Exception:
-                RNS.log(f"[{self.name}] RX invalid base64 payload", RNS.LOG_WARNING)
+                data = base64.b64decode(msg_str, validate=True)
+            except Exception as e:
+                RNS.log(f"[{self.name}] RX invalid base64: {e}", RNS.LOG_WARNING)
                 return
             
             if len(data) < 1:
@@ -489,15 +490,16 @@ class MeshCoreInterface(Interface):
     async def _send(self, data):
         """Send RNS packet as channel message"""
         try:
-            msg_str = base64.b64encode(data).decode("ascii")
-            result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
-            #result = await self._send_channel_raw(self.channel_idx, msg_str)
-            #result = await self._send_raw(data)
+            for i in range(self.count_repeat):
+                msg_str = base64.b64encode(data).decode("ascii")
+                result = await self.mesh.commands.send_chan_msg(self.channel_idx, msg_str)
+                #result = await self._send_channel_raw(self.channel_idx, msg_str)
+                #result = await self._send_raw(data)
 
-            if result.type == self._event_type_cls.ERROR:
-                RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
-            RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
-            RNS.log(f"[{self.name}] TX data: {msg_str}", RNS.LOG_DEBUG)
+                if result.type == self._event_type_cls.ERROR:
+                    RNS.log(f"[{self.name}] TX channel error: {result}", RNS.LOG_WARNING)
+                RNS.log(f"[{self.name}] TX channel result: {result}", RNS.LOG_DEBUG)
+                RNS.log(f"[{self.name}] TX data: {msg_str}", RNS.LOG_DEBUG)
             
                 
         except Exception as e:
