@@ -264,35 +264,34 @@ class MeshCoreInterface(Interface):
         return await self._meshcore_cls.create_ble()
 
     def _fragment_outgoing(self, data):
-        """Split large packets into fragments"""
         if len(data) <= FRAGMENT_MTU:
             return [bytes([FLAG_UNFRAGMENTED]) + data]
         
         fragments = []
-        frag_id = hashlib.md5(data).digest()[:2]
+        frag_id_bytes = hashlib.md5(data).digest()[:2]
+        frag_id_key = frag_id_bytes.hex()
         total_chunks = (len(data) + FRAGMENT_MTU - 1) // FRAGMENT_MTU
         
         for idx in range(total_chunks):
             start = idx * FRAGMENT_MTU
             end = min(start + FRAGMENT_MTU, len(data))
             chunk = data[start:end]
-            
-            header = bytes([FLAG_FRAGMENTED]) + frag_id + bytes([idx, total_chunks])
+            header = bytes([FLAG_FRAGMENTED]) + frag_id_bytes + bytes([idx, total_chunks])
             fragments.append(header + chunk)
         
         return fragments
 
     def _reassemble_fragment(self, payload: bytes):
-        """Reassemble fragments. Returns None if not all received yet."""
         if len(payload) < 5:
             return None
+        frag_id_bytes = payload[0:2]
+        frag_id_key = frag_id_bytes.hex()
         
-        frag_id = payload[0:2].hex()
         chunk_idx = payload[2]
         total_chunks = payload[3]
         chunk_data = payload[4:]
         
-        key = frag_id
+        key = frag_id_key
         if key not in self._fragment_meta:
             self._fragment_meta[key] = {"total": total_chunks, "received": set()}
             self._fragment_buffers[key] = {}
@@ -304,11 +303,17 @@ class MeshCoreInterface(Interface):
         meta["received"].add(chunk_idx)
         
         if len(meta["received"]) == meta["total"]:
-            assembled = b''.join(buf[i] for i in range(meta["total"]))
-            del self._fragment_buffers[key]
-            del self._fragment_meta[key]
-            del self._fragment_timestamps[key]
-            return assembled
+            expected_indices = set(range(meta["total"]))
+            if meta["received"] == expected_indices:
+                assembled = b''.join(buf[i] for i in range(meta["total"]))
+                del self._fragment_buffers[key]
+                del self._fragment_meta[key]
+                del self._fragment_timestamps[key]
+                return assembled
+            else:
+                missing = expected_indices - meta["received"]
+                RNS.log(f"[{self.name}] RX frag: missing chunks {missing}", RNS.LOG_DEBUG)
+                return None
         return None
     async def _rx(self, event):
         try:
@@ -334,10 +339,11 @@ class MeshCoreInterface(Interface):
             if payload.get("channel_idx") != self.channel_idx:
                 return
             
-            msg_str = payload.get("message")
+            msg_str = payload.get("text")
             if not msg_str:
                 return
-            
+            msg_str = self.remove_node_name_from_msg(msg_str)
+            print(msg_str)
             data = msg_str.encode('latin-1')
             
             if len(data) < 1:
@@ -473,6 +479,19 @@ class MeshCoreInterface(Interface):
             self.thread.join(timeout=2.0)
         
         RNS.log(f"[{self.name}] Detached", RNS.LOG_INFO)
+    def remove_node_name_from_msg(self, text: str):
+        original_text = text  # сохраним для возможного fallback
+        # Разбиваем по разделителю ": " (все вхождения), удаляем первую часть,
+        # потом соединяем оставшиеся частями через ": " обратно.
+        parts = original_text.split(": ")
+        if len(parts) >= 2:
+            new_text = ": ".join(parts[1:]).strip()
+            if new_text:
+                text = new_text
+            else:
+                # fallback к оригиналу
+                text = original_text
+        return text
 
     def __str__(self):
         return f"MeshCoreInterface[{self.name}]"
