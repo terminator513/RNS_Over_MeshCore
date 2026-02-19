@@ -78,6 +78,7 @@ class MeshCoreInterface(Interface):
         # Fragmentation buffers
         self._fragment_buffers = defaultdict(dict)
         self._fragment_meta = {}
+        self._fragment_timestamps = {}  # {key: timestamp}
         
         # MeshCore refs
         self._meshcore_cls = MeshCore
@@ -289,6 +290,7 @@ class MeshCoreInterface(Interface):
         if key not in self._fragment_meta:
             self._fragment_meta[key] = {"total": total_chunks, "received": set()}
             self._fragment_buffers[key] = {}
+            self._fragment_timestamps[key] = time.time()
         
         meta = self._fragment_meta[key]
         buf = self._fragment_buffers[key]
@@ -299,11 +301,24 @@ class MeshCoreInterface(Interface):
             assembled = b''.join(buf[i] for i in range(meta["total"]))
             del self._fragment_buffers[key]
             del self._fragment_meta[key]
+            del self._fragment_timestamps[key]
             return assembled
         return None
 
     async def _rx(self, event):
         try:
+            now = time.time()
+            with self._lock:
+                expired_keys = [
+                    key for key, ts in self._fragment_timestamps.items()
+                    if now - ts > 30
+                ]
+                for key in expired_keys:
+                    RNS.log(f"[{self.name}] RX: cleaning up expired fragment {key}", RNS.LOG_DEBUG)
+                    self._fragment_buffers.pop(key, None)
+                    self._fragment_meta.pop(key, None)
+                    self._fragment_timestamps.pop(key, None)
+            
             if event.type != self._event_type_cls.CHANNEL_MSG_RECV:
                 return
             
