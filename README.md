@@ -52,7 +52,7 @@ Add the following to your `~/.reticulum/config` file:
    type = MeshCoreInterface
    interface_enabled = true
 
-# === Transport settings ===
+   # === Transport settings ===
    transport = ble           # Options: ble | serial | tcp
    #port = /dev/ttyUSB0       # Serial port if transport = serial
    #baudrate = 115200         # Serial baudrate
